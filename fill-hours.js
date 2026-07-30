@@ -6,6 +6,16 @@ const NOTE = process.argv[3] || '';
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+const NAV_TIMEOUT = 60000;
+
+// BambooHR holds long-lived connections open, so 'networkidle' never fires.
+function open(page, url) {
+  return page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: NAV_TIMEOUT
+  });
+}
+
 // Parse a YYYY-MM-DD string as a UTC date to avoid timezone drift.
 function parseDate(str) {
   if (!DATE_RE.test(str)) {
@@ -90,17 +100,29 @@ const {
   AFTERNOON_END
 } = process.env;
 
+function readCsrfToken() {
+  return (
+    document.querySelector('meta[name="csrf-token"]')?.content ||
+    document.querySelector('meta[name="csrf"]')?.content ||
+    document.querySelector('input[name="CSRFToken"]')?.value ||
+    window.CSRF_TOKEN ||
+    window.csrfToken ||
+    null
+  );
+}
+
 async function getCsrfToken(page) {
-  const token = await page.evaluate(() => {
-    return (
-      document.querySelector('meta[name="csrf-token"]')?.content ||
-      document.querySelector('meta[name="csrf"]')?.content ||
-      document.querySelector('input[name="CSRFToken"]')?.value ||
-      window.CSRF_TOKEN ||
-      window.csrfToken ||
-      null
-    );
-  });
+  let token = null;
+
+  try {
+    const handle = await page.waitForFunction(readCsrfToken, null, {
+      timeout: 30000
+    });
+
+    token = await handle.jsonValue();
+  } catch {
+    // Fall through to the screenshot + error below
+  }
 
   if (!token) {
     await page.screenshot({
@@ -115,11 +137,15 @@ async function getCsrfToken(page) {
 }
 
 async function detectEmployeeId(page) {
-  await page.goto(`${BAMBOO_URL}/home`, {
-    waitUntil: 'networkidle'
-  });
+  await open(page, `${BAMBOO_URL}/home`);
 
   try {
+    await page
+      .locator('a[href*="/employees/timesheet/"]')
+      .first()
+      .waitFor({ state: 'attached', timeout: 20000 });
+
+
     const href = await page
       .locator('a[href*="/employees/timesheet/"]')
       .first()
@@ -181,18 +207,25 @@ async function detectEmployeeId(page) {
 
     console.log('Opening BambooHR...');
 
-    await page.goto(`${BAMBOO_URL}/login.php`, {
-      waitUntil: 'networkidle'
-    });
+    await open(page, `${BAMBOO_URL}/login.php`);
 
     if (page.url().includes('/login.php')) {
       console.log('Logging in...');
 
-      await page.locator('#lemail').fill(BAMBOO_USER);
+      const email = page.locator('#lemail');
+
+      await email.waitFor({ state: 'visible', timeout: 30000 });
+      await email.fill(BAMBOO_USER);
       await page.locator('#password').fill(BAMBOO_PASSWORD);
       await page.locator('#password').press('Enter');
 
-      await page.waitForTimeout(5000);
+      try {
+        await page.waitForURL((url) => !url.pathname.includes('/login.php'), {
+          timeout: 30000
+        });
+      } catch {
+        // Fall through to the login-failed check below
+      }
     }
 
     if (page.url().includes('/login.php')) {
@@ -213,9 +246,7 @@ async function detectEmployeeId(page) {
 
     console.log('Opening timesheet...');
 
-    await page.goto(timesheetUrl, {
-      waitUntil: 'networkidle'
-    });
+    await open(page, timesheetUrl);
 
     const csrfToken = await getCsrfToken(page);
 
